@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/http";
 
 import * as BitbucketApi from "@t3tools/source-control-bitbucket/server/BitbucketApi";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -143,6 +144,7 @@ function makeLayer(input: {
   );
 
   const layer = BitbucketApi.layer.pipe(
+    Layer.provideMerge(SourceControlRateLimit.layer),
     Layer.provide(ServerSourceControlHost.layer),
     Layer.provide(Layer.mock(VcsProcess.VcsProcess)({})),
     Layer.provide(
@@ -736,3 +738,47 @@ it.effect("cuts a response short rather than reading an unbounded diff into memo
     ),
   ),
 );
+
+const listOpen = Effect.gen(function* () {
+  const bitbucket = yield* BitbucketApi.BitbucketApi;
+  return yield* bitbucket.listPullRequests({
+    cwd: "/repo",
+    headSelector: "origin:feature/a",
+    state: "open",
+  });
+});
+
+it.effect("pauses background reads after a 429 instead of sending them", () => {
+  const { execute, layer } = makeLayer({
+    response: () =>
+      new Response("Rate limit exceeded", { status: 429, headers: { "retry-after": "60" } }),
+  });
+
+  return Effect.gen(function* () {
+    const first = yield* Effect.flip(listOpen);
+    assert.strictEqual(first._tag, "BitbucketResponseError");
+
+    const second = yield* Effect.flip(listOpen);
+    assert.strictEqual(second._tag, "SourceControlRateLimitPausedError");
+    assert.strictEqual(execute.mock.calls.length, 1);
+
+    // A read the user is waiting on still goes out.
+    yield* Effect.flip(
+      listOpen.pipe(Effect.provideService(SourceControlRateLimit.Interactive, true)),
+    );
+    assert.strictEqual(execute.mock.calls.length, 2);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("backs off background reads when Bitbucket says the quota is nearly spent", () => {
+  const { execute, layer } = makeLayer({
+    response: () => Response.json({ values: [] }, { headers: { "x-ratelimit-nearlimit": "true" } }),
+  });
+
+  return Effect.gen(function* () {
+    assert.deepStrictEqual(yield* listOpen, []);
+    const paused = yield* Effect.flip(listOpen);
+    assert.strictEqual(paused._tag, "SourceControlRateLimitPausedError");
+    assert.strictEqual(execute.mock.calls.length, 1);
+  }).pipe(Effect.provide(layer));
+});
