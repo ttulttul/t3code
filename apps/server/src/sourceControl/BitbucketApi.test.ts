@@ -3,14 +3,18 @@ import { assert, it, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/http";
 
 import * as BitbucketApi from "@t3tools/source-control-bitbucket/server/BitbucketApi";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -64,6 +68,8 @@ function makeLayer(input: {
     request: HttpClientRequest.HttpClientRequest,
   ) => HttpClientError.HttpClientError;
   readonly stall?: boolean;
+  /** Answers after this long on the TestClock, so concurrent requests queue for a slot. */
+  readonly latency?: Duration.Input;
   readonly git?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
   readonly env?: Record<string, string>;
 }) {
@@ -72,7 +78,9 @@ function makeLayer(input: {
       ? Effect.never
       : input.requestFailure
         ? Effect.fail(input.requestFailure(request))
-        : Effect.succeed(HttpClientResponse.fromWeb(request, input.response(request))),
+        : Effect.sync(() => HttpClientResponse.fromWeb(request, input.response(request))).pipe(
+            Effect.delay(input.latency ?? Duration.zero),
+          ),
   );
   const gitMock = {
     readConfigValue: vi.fn<GitVcsDriver.GitVcsDriver["Service"]["readConfigValue"]>(() =>
@@ -143,6 +151,7 @@ function makeLayer(input: {
   );
 
   const layer = BitbucketApi.layer.pipe(
+    Layer.provideMerge(SourceControlRateLimit.layer),
     Layer.provide(ServerSourceControlHost.layer),
     Layer.provide(Layer.mock(VcsProcess.VcsProcess)({})),
     Layer.provide(
@@ -736,3 +745,67 @@ it.effect("cuts a response short rather than reading an unbounded diff into memo
     ),
   ),
 );
+
+const listOpen = Effect.gen(function* () {
+  const bitbucket = yield* BitbucketApi.BitbucketApi;
+  return yield* bitbucket.listPullRequests({
+    cwd: "/repo",
+    headSelector: "origin:feature/a",
+    state: "open",
+  });
+});
+
+it.effect("pauses background reads after a 429 instead of sending them", () => {
+  const { execute, layer } = makeLayer({
+    response: () =>
+      new Response("Rate limit exceeded", { status: 429, headers: { "retry-after": "60" } }),
+  });
+
+  return Effect.gen(function* () {
+    const first = yield* Effect.flip(listOpen);
+    assert.strictEqual(first._tag, "BitbucketResponseError");
+
+    const second = yield* Effect.flip(listOpen);
+    assert.strictEqual(second._tag, "SourceControlRateLimitPausedError");
+    assert.strictEqual(execute.mock.calls.length, 1);
+
+    // A read the user is waiting on still goes out.
+    yield* Effect.flip(
+      listOpen.pipe(Effect.provideService(SourceControlRateLimit.Interactive, true)),
+    );
+    assert.strictEqual(execute.mock.calls.length, 2);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("backs off background reads when Bitbucket says the quota is nearly spent", () => {
+  const { execute, layer } = makeLayer({
+    response: () => Response.json({ values: [] }, { headers: { "x-ratelimit-nearlimit": "true" } }),
+  });
+
+  return Effect.gen(function* () {
+    assert.deepStrictEqual(yield* listOpen, []);
+    const paused = yield* Effect.flip(listOpen);
+    assert.strictEqual(paused._tag, "SourceControlRateLimitPausedError");
+    assert.strictEqual(execute.mock.calls.length, 1);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("does not send requests that were queued for a slot when a 429 arrived", () => {
+  const { execute, layer } = makeLayer({
+    response: () => new Response("Rate limit exceeded", { status: 429 }),
+    latency: "1 second",
+  });
+
+  return Effect.gen(function* () {
+    const all = yield* Effect.all(
+      Array.from({ length: 12 }, () => Effect.flip(listOpen)),
+      {
+        concurrency: "unbounded",
+      },
+    ).pipe(Effect.forkChild);
+    yield* TestClock.adjust("10 seconds");
+    yield* Fiber.join(all);
+    // Only the requests already holding a slot reach Bitbucket.
+    assert.isAtMost(execute.mock.calls.length, 4);
+  }).pipe(Effect.provide(layer));
+});

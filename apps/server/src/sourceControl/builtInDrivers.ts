@@ -15,6 +15,7 @@ import * as GitHubDriver from "@t3tools/source-control-github/server/driver";
 import * as GitLabCli from "@t3tools/source-control-gitlab/server/GitLabCli";
 import * as GitLabPullRequestCli from "@t3tools/source-control-gitlab/server/GitLabPullRequestCli";
 import * as GitLabDriver from "@t3tools/source-control-gitlab/server/driver";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import type { SourceControlDriver } from "@t3tools/source-control-core/server/driver";
 import * as Layer from "effect/Layer";
 
@@ -41,7 +42,10 @@ export const layer = Layer.mergeAll(
   // reader shares, so the server builds it once, here.
   GitHubPullRequestApi.layer.pipe(Layer.provideMerge(GitHubRest.layerWithDependencies)),
   AzureDevOpsPullRequestCli.layer.pipe(Layer.provideMerge(AzureDevOpsCli.layer)),
-  BitbucketPullRequestApi.layer.pipe(Layer.provideMerge(BitbucketApi.layer)),
+  BitbucketPullRequestApi.layer.pipe(
+    Layer.provideMerge(BitbucketApi.layer),
+    Layer.provideMerge(SourceControlRateLimit.layer),
+  ),
   ForgejoCli.layer,
   GitCafeApi.layer.pipe(Layer.provideMerge(GitCafeCredentials.layer)),
   GitLabPullRequestCli.layer.pipe(Layer.provideMerge(GitLabCli.layer)),

@@ -6,6 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import {
   NonNegativeInt,
   TrimmedNonEmptyString,
@@ -32,12 +33,14 @@ import * as SourceControlHost from "@t3tools/source-control-core/server/SourceCo
 import { readSourceControlHostSettings } from "@t3tools/source-control-core/client/definition";
 
 import * as BitbucketClient from "../client/definition.ts";
-import { retryAtFromHeader } from "@t3tools/source-control-core/server/SourceControlRateLimit";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 
 const DEFAULT_API_BASE_URL = "https://api.bitbucket.org/2.0";
 const DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const BITBUCKET_API_REQUEST_TIMEOUT = "30 seconds";
+/** A startup sweep looks up every thread's branch at once; Bitbucket answers a burst with 429. */
+const CONCURRENCY = 4;
 
 const BitbucketApiEnvConfig = Config.all({
   baseUrl: Config.String("T3CODE_BITBUCKET_API_BASE_URL").pipe(
@@ -262,6 +265,7 @@ export const BitbucketApiError = Schema.Union([
   BitbucketRepositoryRemoteNotFoundError,
   BitbucketPullRequestBodyReadError,
   BitbucketCheckoutError,
+  SourceControlRateLimit.SourceControlRateLimitPausedError,
 ]);
 export type BitbucketApiError = typeof BitbucketApiError.Type;
 const isBitbucketApiError = Schema.is(BitbucketApiError);
@@ -607,7 +611,7 @@ const responseError = Effect.fn("BitbucketApi.responseError")(function* (
   response: HttpClientResponse.HttpClientResponse,
 ): Effect.fn.Return<never, BitbucketApiError> {
   const now = yield* Clock.currentTimeMillis;
-  const retryAt = retryAtFromHeader(response.headers["retry-after"], now);
+  const retryAt = SourceControlRateLimit.retryAtFromHeader(response.headers["retry-after"], now);
   const collected = yield* collectUint8StreamText({
     stream: response.stream,
     maxBytes: DEFAULT_MAX_RESPONSE_BYTES,
@@ -637,6 +641,40 @@ export const make = Effect.gen(function* () {
   const git = host.git;
   const httpClient = yield* HttpClient.HttpClient;
   const fileSystem = yield* FileSystem.FileSystem;
+  const limits = yield* SourceControlRateLimit.SourceControlRateLimit;
+  const slots = yield* Semaphore.make(CONCURRENCY);
+  // The key PullRequestService records its own backoff under, so both see one pause.
+  const rateLimitKey = {
+    provider: BitbucketClient.definition.kind,
+    host: BitbucketClient.definition.publicHost,
+  };
+
+  /**
+   * Sends one request through the shared pause. A 429 pauses background reads host-wide, and so
+   * does `X-RateLimit-NearLimit` (under 20% of the hourly quota left), so a sweep backs off before
+   * Bitbucket refuses it. Writes and reads a user is waiting on still go through while paused.
+   */
+  const execute = Effect.fnUntraced(function* (request: HttpClientRequest.HttpClientRequest) {
+    const allowPaused = request.method !== "GET" || (yield* SourceControlRateLimit.Interactive);
+    // Checked once a slot is held: a request queued behind a 429 must see the pause it recorded.
+    return yield* slots.withPermit(
+      Effect.gen(function* () {
+        const lease = yield* limits.check(rateLimitKey, allowPaused ? { allowPaused } : undefined);
+        const response = yield* httpClient.execute(request);
+        if (response.status === 429 || response.headers["x-ratelimit-nearlimit"] === "true") {
+          const now = yield* Clock.currentTimeMillis;
+          const retryAt = SourceControlRateLimit.retryAtFromHeader(
+            response.headers["retry-after"],
+            now,
+          );
+          yield* limits.recordRateLimit({ ...rateLimitKey, lease, retryAt });
+        } else if (response.status >= 200 && response.status < 300) {
+          yield* limits.recordSuccess({ ...rateLimitKey, lease });
+        }
+        return response;
+      }),
+    );
+  });
 
   const apiUrl = (path: string) => `${config.baseUrl.replace(/\/+$/u, "")}${path}`;
 
@@ -699,14 +737,10 @@ export const make = Effect.gen(function* () {
     schema: S,
   ): Effect.Effect<S["Type"], BitbucketApiError, S["DecodingServices"]> =>
     withAuth(request.pipe(HttpClientRequest.acceptJson)).pipe(
-      Effect.flatMap(httpClient.execute),
-      Effect.mapError(
-        (cause) =>
-          new BitbucketRequestError({
-            operation,
-            cause,
-          }),
-      ),
+      Effect.flatMap(execute),
+      Effect.catchTags({
+        HttpClientError: (cause) => Effect.fail(new BitbucketRequestError({ operation, cause })),
+      }),
       Effect.flatMap((response) => decodeResponse(operation, schema, response)),
       Effect.timeout(BITBUCKET_API_REQUEST_TIMEOUT),
       Effect.catchTags({
@@ -889,10 +923,11 @@ export const make = Effect.gen(function* () {
         ? base
         : base.pipe(HttpClientRequest.bodyText(input.body, "application/json"));
     return withAuth(withBody).pipe(
-      Effect.flatMap(httpClient.execute),
-      Effect.mapError(
-        (cause): BitbucketApiError => new BitbucketRequestError({ operation: "request", cause }),
-      ),
+      Effect.flatMap(execute),
+      Effect.catchTags({
+        HttpClientError: (cause) =>
+          Effect.fail(new BitbucketRequestError({ operation: "request", cause })),
+      }),
       Effect.flatMap((response) => {
         const location = response.headers.location;
         if (
