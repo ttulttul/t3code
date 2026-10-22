@@ -656,19 +656,24 @@ export const make = Effect.gen(function* () {
    */
   const execute = Effect.fnUntraced(function* (request: HttpClientRequest.HttpClientRequest) {
     const allowPaused = request.method !== "GET" || (yield* SourceControlRateLimit.Interactive);
-    const lease = yield* limits.check(rateLimitKey, allowPaused ? { allowPaused } : undefined);
-    const response = yield* slots.withPermit(httpClient.execute(request));
-    if (response.status === 429 || response.headers["x-ratelimit-nearlimit"] === "true") {
-      const now = yield* Clock.currentTimeMillis;
-      const retryAt = SourceControlRateLimit.retryAtFromHeader(
-        response.headers["retry-after"],
-        now,
-      );
-      yield* limits.recordRateLimit({ ...rateLimitKey, lease, retryAt });
-    } else if (response.status >= 200 && response.status < 300) {
-      yield* limits.recordSuccess({ ...rateLimitKey, lease });
-    }
-    return response;
+    // Checked once a slot is held: a request queued behind a 429 must see the pause it recorded.
+    return yield* slots.withPermit(
+      Effect.gen(function* () {
+        const lease = yield* limits.check(rateLimitKey, allowPaused ? { allowPaused } : undefined);
+        const response = yield* httpClient.execute(request);
+        if (response.status === 429 || response.headers["x-ratelimit-nearlimit"] === "true") {
+          const now = yield* Clock.currentTimeMillis;
+          const retryAt = SourceControlRateLimit.retryAtFromHeader(
+            response.headers["retry-after"],
+            now,
+          );
+          yield* limits.recordRateLimit({ ...rateLimitKey, lease, retryAt });
+        } else if (response.status >= 200 && response.status < 300) {
+          yield* limits.recordSuccess({ ...rateLimitKey, lease });
+        }
+        return response;
+      }),
+    );
   });
 
   const apiUrl = (path: string) => `${config.baseUrl.replace(/\/+$/u, "")}${path}`;
